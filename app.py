@@ -42,7 +42,7 @@ def chat():
 
     try:
         response = client.models.generate_content(
-            model="gemini-2.5-flash",
+            model="gemini-3.8-flash",
             contents=[
                 "You are PyNexa AI, a helpful AI assistant "
                 "inside PyNexa AI Studio.\n\n"
