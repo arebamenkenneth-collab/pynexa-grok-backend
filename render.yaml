@@ -1,0 +1,10 @@
+services:
+  - type: web
+    name: pynexa-grok-backend
+    runtime: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: gunicorn app:app
+    healthCheckPath: /
+    envVars:
+      - key: XAI_API_KEY
+        sync: false
