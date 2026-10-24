@@ -1,23 +1,21 @@
 import os
 from flask import Flask, request, jsonify
 from flask_cors import CORS
-from openai import OpenAI
+from google import genai
 
 app = Flask(__name__)
 CORS(app)
 
-api_key = os.environ.get("XAI_API_KEY")
+api_key = os.environ.get("GEMINI_API_KEY")
 
-client = OpenAI(
-    api_key=api_key,
-    base_url="https://api.x.ai/v1"
-) if api_key else None
+client = genai.Client(api_key=api_key) if api_key else None
 
 
 @app.route("/", methods=["GET"])
 def home():
     return jsonify({
         "service": "PyNexa AI Backend",
+        "provider": "Gemini",
         "status": "online"
     })
 
@@ -26,7 +24,7 @@ def home():
 def chat():
     if client is None:
         return jsonify({
-            "error": "AI service is not configured."
+            "error": "Gemini API is not configured."
         }), 500
 
     data = request.get_json(silent=True) or {}
@@ -43,24 +41,16 @@ def chat():
         }), 400
 
     try:
-        response = client.chat.completions.create(
-            model="grok-3-mini",
-            messages=[
-                {
-                    "role": "system",
-                    "content": (
-                        "You are PyNexa AI, a helpful AI assistant "
-                        "inside PyNexa AI Studio."
-                    )
-                },
-                {
-                    "role": "user",
-                    "content": message.strip()
-                }
+        response = client.models.generate_content(
+            model="gemini-2.5-flash",
+            contents=[
+                "You are PyNexa AI, a helpful AI assistant "
+                "inside PyNexa AI Studio.\n\n"
+                + message.strip()
             ]
         )
 
-        reply = response.choices[0].message.content
+        reply = response.text
 
         if not reply:
             return jsonify({
@@ -70,8 +60,7 @@ def chat():
         return jsonify({"reply": reply})
 
     except Exception:
-        app.logger.exception("Grok API request failed")
-
+        app.logger.exception("Gemini API request failed")
         return jsonify({
             "error": "The AI request failed. Please try again."
         }), 502
