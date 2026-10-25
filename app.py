@@ -24,7 +24,6 @@ CORS(app)
 app.config["MAX_CONTENT_LENGTH"] = 1 * 1024 * 1024
 
 api_key = os.environ.get("GEMINI_API_KEY")
-
 client = genai.Client(api_key=api_key) if api_key else None
 
 MODEL_NAME = "gemini-3.8-flash"
@@ -36,6 +35,13 @@ SYSTEM_PROMPT = (
     "Be friendly, professional, and concise when possible."
 )
 
+# Lower thinking effort for quicker responses.
+GENERATION_CONFIG = {
+    "thinking_config": {
+        "thinking_level": "LOW"
+    }
+}
+
 RETRYABLE_ERRORS = (
     "503",
     "UNAVAILABLE",
@@ -45,7 +51,6 @@ RETRYABLE_ERRORS = (
     "INTERNAL",
     "502",
     "504",
-    "UNAVAILABLE",
 )
 
 
@@ -55,7 +60,6 @@ RETRYABLE_ERRORS = (
 
 def validate_message():
     data = request.get_json(silent=True) or {}
-
     message = data.get("message")
 
     if not isinstance(message, str) or not message.strip():
@@ -76,24 +80,28 @@ def validate_message():
 
 
 # ============================================================
-# GEMINI STREAM WITH SAFE RETRIES
+# GEMINI STREAM WITH RETRIES AND TIMING
 # ============================================================
 
 def generate_stream_with_retry(message, attempts=2):
     """
-    Retry temporary Gemini errors.
+    Retry temporary errors only before sending any text.
 
-    If an error occurs before any text is produced,
-    another attempt may be made.
-
-    Once text has been produced, do not restart the
-    response, because that could duplicate the answer.
+    Once text has been yielded, a failed stream is not restarted,
+    preventing duplicate answers.
     """
 
     for attempt in range(attempts):
+        started_at = time.monotonic()
         received_text = False
 
         try:
+            app.logger.info(
+                "Starting Gemini stream. Attempt %s/%s.",
+                attempt + 1,
+                attempts,
+            )
+
             stream = client.models.generate_content_stream(
                 model=MODEL_NAME,
                 contents=(
@@ -101,47 +109,66 @@ def generate_stream_with_retry(message, attempts=2):
                     + "\n\nUser: "
                     + message
                 ),
+                config=GENERATION_CONFIG,
             )
 
             for chunk in stream:
                 text = chunk.text
 
                 if text:
+                    if not received_text:
+                        first_text_time = (
+                            time.monotonic() - started_at
+                        )
+
+                        app.logger.info(
+                            "Gemini first text received after %.2f seconds.",
+                            first_text_time,
+                        )
+
                     received_text = True
                     yield text
+
+            total_time = time.monotonic() - started_at
+
+            app.logger.info(
+                "Gemini stream completed in %.2f seconds.",
+                total_time,
+            )
 
             return
 
         except Exception as error:
+            elapsed = time.monotonic() - started_at
             error_text = str(error).upper()
+
+            app.logger.exception(
+                "Gemini stream failed after %.2f seconds.",
+                elapsed,
+            )
 
             retryable = any(
                 code in error_text
                 for code in RETRYABLE_ERRORS
             )
 
-            # Do not restart after sending text to the client.
+            # Never restart after text has been sent.
             if received_text:
                 raise
 
-            # Do not retry permanent errors.
+            # Don't retry permanent errors.
             if not retryable:
                 raise
 
-            # No attempts remain.
+            # Stop when attempts are exhausted.
             if attempt == attempts - 1:
                 raise
 
-            # Brief delay before the final attempt.
-            delay = min(
-                1 + random.random(),
-                2,
-            )
+            delay = 1 + random.random()
 
             app.logger.warning(
-                "Temporary Gemini error. Retrying attempt %s/%s.",
-                attempt + 2,
-                attempts,
+                "Temporary Gemini error. Retrying in %.2f seconds.",
+                delay,
             )
 
             time.sleep(delay)
@@ -178,6 +205,8 @@ def chat():
     if error:
         return jsonify(error[0]), error[1]
 
+    started_at = time.monotonic()
+
     try:
         response = client.models.generate_content(
             model=MODEL_NAME,
@@ -186,9 +215,15 @@ def chat():
                 + "\n\nUser: "
                 + message
             ),
+            config=GENERATION_CONFIG,
         )
 
         reply = response.text
+
+        app.logger.info(
+            "Regular Gemini request completed in %.2f seconds.",
+            time.monotonic() - started_at,
+        )
 
         if not reply:
             return jsonify({
@@ -246,8 +281,8 @@ def chat_stream():
 
             yield "data: " + json.dumps({
                 "error": (
-                    "PyNexa AI could not complete your "
-                    "response. Please try again."
+                    "PyNexa AI could not complete your response. "
+                    "Please try again."
                 )
             }) + "\n\n"
 
@@ -266,12 +301,10 @@ def chat_stream():
 # ============================================================
 
 if __name__ == "__main__":
-    port = int(
-        os.environ.get("PORT", 10000)
-    )
+    port = int(os.environ.get("PORT", 10000))
 
     app.run(
         host="0.0.0.0",
         port=port,
         threaded=True,
-                )
+)
