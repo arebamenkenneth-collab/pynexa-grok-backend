@@ -1,5 +1,7 @@
 import os
 import json
+import time
+import random
 from flask import Flask, request, jsonify, Response, stream_with_context
 from flask_cors import CORS
 from google import genai
@@ -11,7 +13,28 @@ api_key = os.environ.get("GEMINI_API_KEY")
 client = genai.Client(api_key=api_key) if api_key else None
 
 MODEL_NAME = "gemini-3.8-flash"
+def generate_stream_with_retry(message, attempts=3):
+    for attempt in range(attempts):
+        try:
+            return client.models.generate_content_stream(
+                model=MODEL_NAME,
+                contents=SYSTEM_PROMPT + "\n\nUser: " + message
+            )
+        except Exception as error:
+            error_text = str(error)
 
+            retryable = any(code in error_text for code in [
+                "503", "UNAVAILABLE",
+                "429", "RESOURCE_EXHAUSTED",
+                "500", "INTERNAL",
+                "502", "504"
+            ])
+
+            if not retryable or attempt == attempts - 1:
+                raise
+
+            delay = min(2 ** attempt + random.random(), 8)
+            time.sleep(delay)
 SYSTEM_PROMPT = (
     "You are PyNexa AI, a helpful, intelligent AI assistant "
     "inside PyNexa AI Studio. Give clear, accurate, and useful "
@@ -99,11 +122,7 @@ def chat_stream():
 
     def generate():
         try:
-            stream = client.models.generate_content_stream(
-                model=MODEL_NAME,
-                contents=SYSTEM_PROMPT + "\n\nUser: " + message
-            )
-
+            stream = generate_stream_with_retry(message)
             for chunk in stream:
                 text = chunk.text
 
