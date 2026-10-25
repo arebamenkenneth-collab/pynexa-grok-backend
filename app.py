@@ -26,7 +26,7 @@ app.config["MAX_CONTENT_LENGTH"] = 1 * 1024 * 1024
 api_key = os.environ.get("GEMINI_API_KEY")
 client = genai.Client(api_key=api_key) if api_key else None
 
-MODEL_NAME = "gemini-3.8-flash"
+MODEL_NAME = "gemini-3.6-flash"
 
 SYSTEM_PROMPT = (
     "You are PyNexa AI, a helpful, intelligent AI assistant "
