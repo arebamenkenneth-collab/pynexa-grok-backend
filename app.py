@@ -1,7 +1,6 @@
 import os
 import json
 import time
-import random
 
 from flask import (
     Flask,
@@ -26,7 +25,20 @@ app.config["MAX_CONTENT_LENGTH"] = 1 * 1024 * 1024
 api_key = os.environ.get("GEMINI_API_KEY")
 client = genai.Client(api_key=api_key) if api_key else None
 
+
+# ============================================================
+# MODEL CONFIGURATION
+# ============================================================
+
+# Primary model followed by a backup model.
 MODEL_NAME = "gemini-3.6-flash"
+
+FALLBACK_MODELS = [
+    "gemini-3.5-flash-lite",
+]
+
+MODEL_CANDIDATES = [MODEL_NAME] + FALLBACK_MODELS
+
 
 SYSTEM_PROMPT = (
     "You are PyNexa AI, a helpful, intelligent AI assistant "
@@ -35,13 +47,15 @@ SYSTEM_PROMPT = (
     "Be friendly, professional, and concise when possible."
 )
 
-# Lower thinking effort for quicker responses.
+
 GENERATION_CONFIG = {
     "thinking_config": {
         "thinking_level": "LOW"
     }
 }
 
+
+# Only these temporary errors should trigger model fallback.
 RETRYABLE_ERRORS = (
     "503",
     "UNAVAILABLE",
@@ -51,6 +65,8 @@ RETRYABLE_ERRORS = (
     "INTERNAL",
     "502",
     "504",
+    "SERVICE_UNAVAILABLE",
+    "DEADLINE_EXCEEDED",
 )
 
 
@@ -80,30 +96,131 @@ def validate_message():
 
 
 # ============================================================
-# GEMINI STREAM WITH RETRIES AND TIMING
+# ERROR HELPERS
 # ============================================================
 
-def generate_stream_with_retry(message, attempts=2):
-    """
-    Retry temporary errors only before sending any text.
+def is_retryable_error(error):
+    error_text = str(error).upper()
 
-    Once text has been yielded, a failed stream is not restarted,
-    preventing duplicate answers.
+    return any(
+        code in error_text
+        for code in RETRYABLE_ERRORS
+    )
+
+
+def log_model_failure(model, error):
+    app.logger.warning(
+        "Gemini model %s failed: %s",
+        model,
+        str(error),
+    )
+
+
+# ============================================================
+# REGULAR GEMINI GENERATION WITH FALLBACK
+# ============================================================
+
+def generate_response_with_fallback(message):
+    """
+    Try the primary model first.
+
+    If a temporary service error occurs, try the backup model.
+    The Google GenAI SDK handles its own transient retries.
     """
 
-    for attempt in range(attempts):
+    last_error = None
+
+    for index, model in enumerate(MODEL_CANDIDATES):
+        started_at = time.monotonic()
+
+        try:
+            app.logger.info(
+                "Starting regular Gemini request using %s.",
+                model,
+            )
+
+            response = client.models.generate_content(
+                model=model,
+                contents=(
+                    SYSTEM_PROMPT
+                    + "\n\nUser: "
+                    + message
+                ),
+                config=GENERATION_CONFIG,
+            )
+
+            reply = response.text
+
+            if not reply:
+                raise RuntimeError(
+                    "Gemini returned an empty response."
+                )
+
+            app.logger.info(
+                "Model %s completed in %.2f seconds.",
+                model,
+                time.monotonic() - started_at,
+            )
+
+            return reply
+
+        except Exception as error:
+            last_error = error
+
+            app.logger.exception(
+                "Regular Gemini request failed using %s.",
+                model,
+            )
+
+            # Do not switch models for permanent errors.
+            if not is_retryable_error(error):
+                raise
+
+            # No more models available.
+            if index == len(MODEL_CANDIDATES) - 1:
+                break
+
+            app.logger.warning(
+                "Temporary failure on %s. "
+                "Trying fallback model %s.",
+                model,
+                MODEL_CANDIDATES[index + 1],
+            )
+
+    if last_error is not None:
+        raise last_error
+
+    raise RuntimeError(
+        "No Gemini models are configured."
+    )
+
+
+# ============================================================
+# STREAMING GENERATION WITH FALLBACK
+# ============================================================
+
+def generate_stream_with_fallback(message):
+    """
+    Try models in order.
+
+    Fallback is allowed only before any text has been sent.
+    This prevents duplicate or mixed responses in the stream.
+    """
+
+    last_error = None
+
+    for index, model in enumerate(MODEL_CANDIDATES):
         started_at = time.monotonic()
         received_text = False
 
         try:
             app.logger.info(
-                "Starting Gemini stream. Attempt %s/%s.",
-                attempt + 1,
-                attempts,
+                "Starting Gemini stream with %s.",
+                model,
             )
 
             stream = client.models.generate_content_stream(
-                model=MODEL_NAME,
+                model=model,
                 contents=(
                     SYSTEM_PROMPT
                     + "\n\nUser: "
@@ -117,61 +234,56 @@ def generate_stream_with_retry(message, attempts=2):
 
                 if text:
                     if not received_text:
-                        first_text_time = (
-                            time.monotonic() - started_at
-                        )
-
                         app.logger.info(
-                            "Gemini first text received after %.2f seconds.",
-                            first_text_time,
+                            "First text from %s received "
+                            "after %.2f seconds.",
+                            model,
+                            time.monotonic() - started_at,
                         )
 
                     received_text = True
                     yield text
 
-            total_time = time.monotonic() - started_at
-
             app.logger.info(
-                "Gemini stream completed in %.2f seconds.",
-                total_time,
+                "Streaming with %s completed in %.2f seconds.",
+                model,
+                time.monotonic() - started_at,
             )
 
             return
 
         except Exception as error:
-            elapsed = time.monotonic() - started_at
-            error_text = str(error).upper()
+            last_error = error
 
             app.logger.exception(
-                "Gemini stream failed after %.2f seconds.",
-                elapsed,
+                "Gemini stream failed using %s.",
+                model,
             )
 
-            retryable = any(
-                code in error_text
-                for code in RETRYABLE_ERRORS
-            )
-
-            # Never restart after text has been sent.
+            # Once text has been delivered, do not restart
+            # the answer with a different model.
             if received_text:
                 raise
 
-            # Don't retry permanent errors.
-            if not retryable:
+            if not is_retryable_error(error):
                 raise
 
-            # Stop when attempts are exhausted.
-            if attempt == attempts - 1:
-                raise
-
-            delay = 1 + random.random()
+            if index == len(MODEL_CANDIDATES) - 1:
+                break
 
             app.logger.warning(
-                "Temporary Gemini error. Retrying in %.2f seconds.",
-                delay,
+                "Temporary streaming failure on %s. "
+                "Switching to fallback model %s.",
+                model,
+                MODEL_CANDIDATES[index + 1],
             )
 
-            time.sleep(delay)
+    if last_error is not None:
+        raise last_error
+
+    raise RuntimeError(
+        "No Gemini models are configured."
+    )
 
 
 # ============================================================
@@ -186,6 +298,7 @@ def home():
         "status": "online",
         "streaming": True,
         "model": MODEL_NAME,
+        "fallback_models": FALLBACK_MODELS,
     })
 
 
@@ -205,30 +318,8 @@ def chat():
     if error:
         return jsonify(error[0]), error[1]
 
-    started_at = time.monotonic()
-
     try:
-        response = client.models.generate_content(
-            model=MODEL_NAME,
-            contents=(
-                SYSTEM_PROMPT
-                + "\n\nUser: "
-                + message
-            ),
-            config=GENERATION_CONFIG,
-        )
-
-        reply = response.text
-
-        app.logger.info(
-            "Regular Gemini request completed in %.2f seconds.",
-            time.monotonic() - started_at,
-        )
-
-        if not reply:
-            return jsonify({
-                "error": "The AI returned an empty response."
-            }), 502
+        reply = generate_response_with_fallback(message)
 
         return jsonify({
             "reply": reply
@@ -236,13 +327,13 @@ def chat():
 
     except Exception:
         app.logger.exception(
-            "Gemini chat request failed."
+            "Gemini chat request failed on all available models."
         )
 
         return jsonify({
             "error": (
-                "PyNexa AI could not complete your request. "
-                "Please try again."
+                "PyNexa AI is temporarily unavailable. "
+                "Please try again shortly."
             )
         }), 502
 
@@ -265,7 +356,7 @@ def chat_stream():
 
     def generate():
         try:
-            for text in generate_stream_with_retry(message):
+            for text in generate_stream_with_fallback(message):
                 yield "data: " + json.dumps({
                     "text": text
                 }) + "\n\n"
@@ -276,13 +367,13 @@ def chat_stream():
 
         except Exception:
             app.logger.exception(
-                "Gemini streaming request failed."
+                "Gemini streaming request failed on all available models."
             )
 
             yield "data: " + json.dumps({
                 "error": (
-                    "PyNexa AI could not complete your response. "
-                    "Please try again."
+                    "PyNexa AI is temporarily unavailable. "
+                    "Please try again shortly."
                 )
             }) + "\n\n"
 
@@ -307,4 +398,4 @@ if __name__ == "__main__":
         host="0.0.0.0",
         port=port,
         threaded=True,
-)
+    )
